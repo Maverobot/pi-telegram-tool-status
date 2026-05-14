@@ -8,7 +8,7 @@
  * first tool is actually called.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -56,32 +56,6 @@ async function isTelegramConnected(cwd: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-// --- Detect Telegram-originated turns ---
-
-function isTelegramTurn(ctx: ExtensionContext): boolean {
-	const entries = ctx.sessionManager.getEntries();
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i] as any;
-		if (entry.type !== "message") continue;
-		if (entry.message?.role !== "user") continue;
-
-		let text = "";
-		const content = entry.message.content;
-		if (typeof content === "string") {
-			text = content;
-		} else if (Array.isArray(content)) {
-			text = content
-				.filter((c: any) => c.type === "text")
-				.map((c: any) => c.text)
-				.join("\n");
-		}
-
-		// pi-telegram prefixes all bridged prompts with [telegram]
-		return text.startsWith("[telegram]") || text.includes("\n[telegram]");
-	}
-	return false;
 }
 
 // --- Telegram API ---
@@ -295,9 +269,10 @@ let activeTurnIsTelegram = false;
 let initPromise: Promise<void> | undefined;
 
 export default function (pi: ExtensionAPI) {
-	pi.on("agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		activeTurnIsTelegram =
-			(await isTelegramConnected(ctx.cwd)) && isTelegramTurn(ctx);
+			(await isTelegramConnected(ctx.cwd)) &&
+			!!(event.prompt?.startsWith("[telegram]") ?? false);
 		if (!activeTurnIsTelegram) return;
 
 		// Reset state for a new Telegram-originated user prompt
