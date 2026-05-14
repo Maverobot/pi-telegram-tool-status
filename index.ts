@@ -451,7 +451,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Telegram Settings Section ---
-	// Gracefully skip if pi-telegram is not installed / not loaded yet
+	// Use globalThis bridge because pi-telegram publishes raw .ts files
+	// without package.json exports. The globalThis registry is set by
+	// pi-telegram at startup and is the documented zero-coupling approach.
 	const registry = (globalThis as any).__piTelegramSectionRegistry__;
 	if (typeof registry?.register === "function") {
 		let sectionSettings: ExtensionSettings = { ...DEFAULT_SETTINGS };
