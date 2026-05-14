@@ -351,11 +351,13 @@ export default function (pi: ExtensionAPI) {
 		// Proactive push: if this was a console turn with tool calls and
 		// proactivePush is enabled, send a one-shot service message.
 		if (!activeTurnIsTelegram && toolCalls.length > 0) {
+			const capturedCalls = toolCalls.slice(); // snapshot before clear
+			const capturedCwd = currentCwd;
 			(async () => {
 				try {
 					if (
-						!currentCwd ||
-						!(await isTelegramConnected(currentCwd))
+						!capturedCwd ||
+						!(await isTelegramConnected(capturedCwd))
 					) {
 						return;
 					}
@@ -367,7 +369,7 @@ export default function (pi: ExtensionAPI) {
 					) {
 						return;
 					}
-					const text = buildServiceMessageText(toolCalls);
+					const text = buildServiceMessageText(capturedCalls);
 					await telegramApiCall(config.botToken, "sendMessage", {
 						chat_id: currentChatId,
 						text,
