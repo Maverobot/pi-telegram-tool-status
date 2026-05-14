@@ -9,9 +9,47 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+
+// --- Extension Settings ---
+
+interface ExtensionSettings {
+	enabled: boolean;
+	proactivePushTools: boolean;
+}
+
+const DEFAULT_SETTINGS: ExtensionSettings = {
+	enabled: true,
+	proactivePushTools: true,
+};
+
+function getExtensionConfigPath(): string {
+	return join(getAgentDir(), "pi-telegram-tool-status.json");
+}
+
+async function loadExtensionSettings(): Promise<ExtensionSettings> {
+	try {
+		const content = await readFile(getExtensionConfigPath(), "utf8");
+		const parsed = JSON.parse(content) as Partial<ExtensionSettings>;
+		return { ...DEFAULT_SETTINGS, ...parsed };
+	} catch {
+		return { ...DEFAULT_SETTINGS };
+	}
+}
+
+async function saveExtensionSettings(settings: ExtensionSettings): Promise<void> {
+	try {
+		await writeFile(
+			getExtensionConfigPath(),
+			JSON.stringify(settings, null, "\t") + "\n",
+			{ mode: 0o600 },
+		);
+	} catch {
+		// ignore
+	}
+}
 
 // --- Config ---
 
@@ -270,6 +308,9 @@ let currentCwd: string | undefined;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
+		const settings = await loadExtensionSettings();
+		if (!settings.enabled) return;
+
 		currentCwd = ctx.cwd;
 		activeTurnIsTelegram =
 			(await isTelegramConnected(ctx.cwd)) &&
@@ -288,6 +329,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_start", async (event, ctx) => {
+		const settings = await loadExtensionSettings();
+		if (!settings.enabled) return;
+
 		// Always collect tool calls (needed for proactive push on console turns)
 		const detail = formatToolDetail(
 			event.toolName,
@@ -348,6 +392,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async () => {
+		const settings = await loadExtensionSettings();
+		if (!settings.enabled) {
+			activeTurnIsTelegram = false;
+			initPromise = undefined;
+			toolCalls = [];
+			nextIndex = 1;
+			return;
+		}
+
 		// Proactive push: if this was a console turn with tool calls and
 		// proactivePush is enabled, send a one-shot service message.
 		if (!activeTurnIsTelegram && toolCalls.length > 0) {
@@ -369,6 +422,8 @@ export default function (pi: ExtensionAPI) {
 					) {
 						return;
 					}
+					// Also respect extension-level proactivePushTools setting
+					if (!settings.proactivePushTools) return;
 					const text = buildServiceMessageText(capturedCalls);
 					await telegramApiCall(config.botToken, "sendMessage", {
 						chat_id: currentChatId,
@@ -394,4 +449,148 @@ export default function (pi: ExtensionAPI) {
 		toolCalls = [];
 		nextIndex = 1;
 	});
+
+	// --- Telegram Settings Section ---
+	// Gracefully skip if pi-telegram is not installed / not loaded yet
+	try {
+		const { registerTelegramSection } = require("@llblab/pi-telegram/lib/extension-sections.ts");
+		if (typeof registerTelegramSection === "function") {
+			let sectionSettings: ExtensionSettings = { ...DEFAULT_SETTINGS };
+
+			const unregister = registerTelegramSection({
+				id: "pi-telegram-tool-status",
+				label: "🛠 Tool Status",
+				order: 20,
+				render: async (ctx) => {
+					sectionSettings = await loadExtensionSettings();
+					return {
+						text: `<b>🛠 Tool Status</b>\n\nLive service message listing tools used by the agent.`,
+						parseMode: "html",
+						replyMarkup: {
+							inline_keyboard: [
+								[
+									{
+										text: "📄 View config",
+										callback_data: ctx.callbackData("view-config"),
+									},
+								],
+							],
+						},
+					};
+				},
+				handleCallback: async (ctx) => {
+					if (ctx.action === "view-config") {
+						await ctx.answerCallback();
+						return "handled";
+					}
+					return "pass";
+				},
+				settings: {
+					label: "🛠 Tool Status",
+					order: 10,
+					getLabel: () => {
+						const enabled = sectionSettings.enabled;
+						return `${enabled ? "🟢" : "⚫️"} Tool Status`;
+					},
+					open: async (ctx) => {
+						sectionSettings = await loadExtensionSettings();
+						const s = sectionSettings;
+						return {
+							text: `<b>🛠 Tool Status Settings</b>\n\nConfigure when the extension sends tool-usage messages.`,
+							parseMode: "html",
+							replyMarkup: {
+								inline_keyboard: [
+									[
+										{
+											text: `${s.enabled ? "🟢 ON" : "⚫️ OFF"} Extension enabled`,
+											callback_data: ctx.callbackData("toggle-enabled"),
+										},
+									],
+									[
+										{
+											text: `${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"} Proactive push tools`,
+											callback_data: ctx.callbackData("toggle-proactive"),
+										},
+									],
+								],
+							},
+						};
+					},
+					handleCallback: async (ctx) => {
+						if (ctx.action === "toggle-enabled") {
+							sectionSettings.enabled = !sectionSettings.enabled;
+							await saveExtensionSettings(sectionSettings);
+							await ctx.answerCallback(
+								sectionSettings.enabled
+									? "Extension enabled"
+									: "Extension disabled",
+							);
+							// Re-render settings view
+							const s = sectionSettings;
+							await ctx.edit({
+								text: `<b>🛠 Tool Status Settings</b>\n\nConfigure when the extension sends tool-usage messages.`,
+								parseMode: "html",
+								replyMarkup: {
+									inline_keyboard: [
+										[
+											{
+												text: `${s.enabled ? "🟢 ON" : "⚫️ OFF"} Extension enabled`,
+												callback_data: ctx.callbackData("toggle-enabled"),
+											},
+										],
+										[
+											{
+												text: `${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"} Proactive push tools`,
+												callback_data: ctx.callbackData("toggle-proactive"),
+											},
+										],
+									],
+								},
+							});
+							return "handled";
+						}
+						if (ctx.action === "toggle-proactive") {
+							sectionSettings.proactivePushTools = !sectionSettings.proactivePushTools;
+							await saveExtensionSettings(sectionSettings);
+							await ctx.answerCallback(
+								sectionSettings.proactivePushTools
+									? "Proactive push tools enabled"
+									: "Proactive push tools disabled",
+							);
+							// Re-render settings view
+							const s = sectionSettings;
+							await ctx.edit({
+								text: `<b>🛠 Tool Status Settings</b>\n\nConfigure when the extension sends tool-usage messages.`,
+								parseMode: "html",
+								replyMarkup: {
+									inline_keyboard: [
+										[
+											{
+												text: `${s.enabled ? "🟢 ON" : "⚫️ OFF"} Extension enabled`,
+												callback_data: ctx.callbackData("toggle-enabled"),
+											},
+										],
+										[
+											{
+												text: `${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"} Proactive push tools`,
+												callback_data: ctx.callbackData("toggle-proactive"),
+											},
+										],
+									],
+								},
+							});
+							return "handled";
+						}
+						return "pass";
+					},
+				},
+			});
+
+			pi.on("session_shutdown", () => {
+				unregister();
+			});
+		}
+	} catch {
+		// pi-telegram not available — skip Telegram sections gracefully
+	}
 }
