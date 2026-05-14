@@ -465,6 +465,16 @@ export default function (pi: ExtensionAPI) {
 		sectionUnregister = registry.register({
 			id: "pi-telegram-tool-status",
 			label: "🛠 Tool Status",
+			render: async (_ctx: any) => {
+				const s = sectionSettings;
+				return {
+					text: `<b>🛠 Tool Status</b>\n\nStatus: ${s.enabled ? "🟢 ON" : "⚫️ OFF"}\nProactive push: ${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"}\n\nShows a live service message listing tools used by the agent during each Telegram prompt.`,
+					parseMode: "html",
+				};
+			},
+			handleCallback: async (_ctx: any) => {
+				return "pass";
+			},
 			settings: {
 				label: "🛠 Tool Status",
 				order: 10,
