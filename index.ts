@@ -575,4 +575,3 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 }
-}
