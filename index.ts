@@ -1,11 +1,10 @@
 /**
  * pi-telegram-tool-status
  *
- * Companion extension for pi-telegram that shows a compact service message
- * listing tools used by the agent. One service message is created per
- * user prompt (only Telegram-originated turns) and edited in-place as
- * new tool calls arrive. Lazy creation: the message is sent only when the
- * first tool is actually called.
+ * Companion extension for pi-telegram that shows compact Telegram-native
+ * tool progress during Telegram-originated turns. It sends individual
+ * messages for the first few tool calls, then switches to one overflow
+ * summary message for very tool-heavy turns.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -132,6 +131,7 @@ async function telegramApiCall(
 
 const MAX_DETAIL_LEN = 50; // universal compact limit for all tools
 const MAX_VISIBLE_ITEMS = 15;
+export const MAX_INDIVIDUAL_TOOL_MESSAGES = 10;
 
 function truncateTail(text: string, max: number): string {
 	if (text.length <= max) return text;
@@ -263,11 +263,65 @@ function formatToolDetail(
 	return toolName;
 }
 
-interface ToolCallInfo {
+export interface ToolCallInfo {
 	index: number;
 	toolName: string;
 	emoji: string;
 	detail: string;
+}
+
+export function buildLiveToolMessage(call: ToolCallInfo): string {
+	const separator = call.detail ? " — " : "";
+	return `🛠 ${call.index}. ${call.emoji} ${call.toolName}${separator}${call.detail}`;
+}
+
+export function buildOverflowServiceMessageText(calls: ToolCallInfo[]): string {
+	const overflowCalls = calls.slice(MAX_INDIVIDUAL_TOOL_MESSAGES);
+	if (overflowCalls.length === 0) {
+		return "🛠 More tools used:\n\n";
+	}
+
+	const hiddenCount = overflowCalls.length - MAX_VISIBLE_ITEMS;
+	const visibleCalls =
+		hiddenCount > 0 ? overflowCalls.slice(-MAX_VISIBLE_ITEMS) : overflowCalls;
+
+	const lines: string[] = ["🛠 More tools used:", ""];
+
+	if (hiddenCount > 0) {
+		lines.push(`… ${hiddenCount} more action${hiddenCount !== 1 ? "s" : ""} hidden`);
+	}
+
+	for (const call of visibleCalls) {
+		const detail = call.detail;
+		const separator = detail ? " — " : "";
+		lines.push(
+			`${call.index}. ${call.emoji} ${call.toolName}${separator}${detail}`,
+		);
+	}
+
+	return lines.join("\n");
+}
+
+export type LiveToolDeliveryPlan =
+	| { type: "individual"; text: string }
+	| { type: "create-overflow"; text: string }
+	| { type: "update-overflow"; text: string };
+
+export function planLiveToolDelivery(
+	calls: ToolCallInfo[],
+	overflowMessageExists: boolean,
+): LiveToolDeliveryPlan | undefined {
+	const latestCall = calls[calls.length - 1];
+	if (!latestCall) return undefined;
+
+	if (calls.length <= MAX_INDIVIDUAL_TOOL_MESSAGES) {
+		return { type: "individual", text: buildLiveToolMessage(latestCall) };
+	}
+
+	return {
+		type: overflowMessageExists ? "update-overflow" : "create-overflow",
+		text: buildOverflowServiceMessageText(calls),
+	};
 }
 
 function buildServiceMessageText(calls: ToolCallInfo[]): string {
@@ -298,12 +352,12 @@ function buildServiceMessageText(calls: ToolCallInfo[]): string {
 
 // --- State ---
 
-let currentServiceMessageId: number | undefined;
+let overflowServiceMessageId: number | undefined;
 let currentChatId: number | undefined;
 let toolCalls: ToolCallInfo[] = [];
 let nextIndex = 1;
 let activeTurnIsTelegram = false;
-let initPromise: Promise<void> | undefined;
+let overflowInitPromise: Promise<void> | undefined;
 let currentCwd: string | undefined;
 
 export default function (pi: ExtensionAPI) {
@@ -317,10 +371,10 @@ export default function (pi: ExtensionAPI) {
 			!!(event.prompt?.startsWith("[telegram]") ?? false);
 
 		// Reset tool tracking for every new turn (Telegram or console)
-		currentServiceMessageId = undefined;
+		overflowServiceMessageId = undefined;
 		toolCalls = [];
 		nextIndex = 1;
-		initPromise = undefined;
+		overflowInitPromise = undefined;
 
 		const config = await loadTelegramConfig();
 		if (config.botToken && config.allowedUserId) {
@@ -344,50 +398,66 @@ export default function (pi: ExtensionAPI) {
 			detail,
 		});
 
-		// Only manage live service message for Telegram-originated turns
+		// Only manage live progress messages for Telegram-originated turns.
 		if (!activeTurnIsTelegram) return;
 		if (!(await isTelegramConnected(ctx.cwd))) return;
 		if (!currentChatId) return;
 
-		// Lazy-create the service message on the very first tool call
-		if (!currentServiceMessageId) {
-			if (!initPromise) {
-				initPromise = (async () => {
-					const config = await loadTelegramConfig();
-					if (!config.botToken) return;
-					const result = (await telegramApiCall(
-						config.botToken,
-						"sendMessage",
-						{
-							chat_id: currentChatId,
-							text: "🛠 Tools used:\n\n",
-						},
-					)) as { message_id: number };
-					currentServiceMessageId = result.message_id;
-				})();
-			}
-			try {
-				await initPromise;
-			} catch {
-				return;
-			}
-		}
-
-		if (!currentServiceMessageId) return;
-
 		const config = await loadTelegramConfig();
 		if (!config.botToken) return;
 
-		const text = buildServiceMessageText(toolCalls);
+		const plan = planLiveToolDelivery(
+			toolCalls,
+			!!overflowServiceMessageId || !!overflowInitPromise,
+		);
+		if (!plan) return;
+
+		if (plan.type === "individual") {
+			try {
+				await telegramApiCall(config.botToken, "sendMessage", {
+					chat_id: currentChatId,
+					text: plan.text,
+				});
+			} catch {
+				// Ignore send failures so tool execution is never blocked.
+			}
+			return;
+		}
+
+		if (plan.type === "create-overflow") {
+			if (!overflowInitPromise) {
+				overflowInitPromise = (async () => {
+					const result = (await telegramApiCall(
+						config.botToken!,
+						"sendMessage",
+						{
+							chat_id: currentChatId,
+							text: plan.text,
+						},
+					)) as { message_id: number };
+					overflowServiceMessageId = result.message_id;
+				})();
+			}
+			try {
+				await overflowInitPromise;
+			} catch {
+				// Ignore send failures so tool execution is never blocked.
+			}
+			return;
+		}
 
 		try {
+			if (!overflowServiceMessageId && overflowInitPromise) {
+				await overflowInitPromise;
+			}
+			if (!overflowServiceMessageId) return;
 			await telegramApiCall(config.botToken, "editMessageText", {
 				chat_id: currentChatId,
-				message_id: currentServiceMessageId,
-				text,
+				message_id: overflowServiceMessageId,
+				text: plan.text,
 			});
 		} catch {
-			// Ignore edit failures (message may have been deleted, etc.)
+			// Ignore edit failures (message may have been deleted, etc.).
 		}
 	});
 
@@ -395,7 +465,7 @@ export default function (pi: ExtensionAPI) {
 		const settings = await loadExtensionSettings();
 		if (!settings.enabled) {
 			activeTurnIsTelegram = false;
-			initPromise = undefined;
+			overflowInitPromise = undefined;
 			toolCalls = [];
 			nextIndex = 1;
 			return;
@@ -436,15 +506,15 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		activeTurnIsTelegram = false;
-		initPromise = undefined;
+		overflowInitPromise = undefined;
 		toolCalls = [];
 		nextIndex = 1;
 	});
 
 	pi.on("session_shutdown", async () => {
 		activeTurnIsTelegram = false;
-		initPromise = undefined;
-		currentServiceMessageId = undefined;
+		overflowInitPromise = undefined;
+		overflowServiceMessageId = undefined;
 		currentChatId = undefined;
 		toolCalls = [];
 		nextIndex = 1;
@@ -468,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 			render: async (_ctx: any) => {
 				const s = sectionSettings;
 				return {
-					text: `<b>🛠 Tool Status</b>\n\nStatus: ${s.enabled ? "🟢 ON" : "⚫️ OFF"}\nProactive push: ${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"}\n\nShows a live service message listing tools used by the agent during each Telegram prompt.`,
+					text: `<b>🛠 Tool Status</b>\n\nStatus: ${s.enabled ? "🟢 ON" : "⚫️ OFF"}\nProactive push: ${s.proactivePushTools ? "🟢 ON" : "⚫️ OFF"}\n\nShows live tool progress during each Telegram prompt.`,
 					parseMode: "html",
 				};
 			},
